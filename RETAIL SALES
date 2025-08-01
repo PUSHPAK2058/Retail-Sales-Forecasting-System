@@ -1,0 +1,497 @@
+# Retail Sales Forecasting System
+# Comprehensive approach using time series analysis, feature engineering, and multiple ML models
+
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# ML and forecasting libraries
+import xgboost as xgb
+from prophet import Prophet
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestRegressor
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.stattools import adfuller
+
+class RetailSalesForecaster:
+    def __init__(self):
+        self.data = None
+        self.models = {}
+        self.scalers = {}
+        self.feature_importance = {}
+        
+    def generate_sample_data(self, start_date='2020-01-01', periods=1000):
+        """Generate realistic retail sales sample data"""
+        np.random.seed(42)
+        
+        # Create date range
+        dates = pd.date_range(start=start_date, periods=periods, freq='D')
+        
+        # Base trend (growing business)
+        trend = np.linspace(1000, 2000, periods)
+        
+        # Seasonal patterns (weekly and monthly)
+        weekly_seasonal = 200 * np.sin(2 * np.pi * np.arange(periods) / 7)
+        monthly_seasonal = 300 * np.sin(2 * np.pi * np.arange(periods) / 30)
+        
+        # Holiday effects and promotions
+        holiday_boost = np.random.choice([0, 500, 800], periods, p=[0.85, 0.1, 0.05])
+        
+        # Random noise
+        noise = np.random.normal(0, 100, periods)
+        
+        # Weather effect (temperature proxy)
+        temperature = 20 + 15 * np.sin(2 * np.pi * np.arange(periods) / 365) + np.random.normal(0, 5, periods)
+        weather_effect = np.where(temperature > 25, 100, np.where(temperature < 10, -50, 0))
+        
+        # Calculate final sales
+        sales = trend + weekly_seasonal + monthly_seasonal + holiday_boost + weather_effect + noise
+        sales = np.maximum(sales, 100)  # Ensure positive sales
+        
+        # Create DataFrame
+        self.data = pd.DataFrame({
+            'date': dates,
+            'sales': sales,
+            'temperature': temperature,
+            'is_weekend': dates.weekday >= 5,
+            'month': dates.month,
+            'day_of_week': dates.weekday,
+            'day_of_month': dates.day,
+            'quarter': dates.quarter,
+            'is_promotion': holiday_boost > 0
+        })
+        
+        print(f"Generated {len(self.data)} days of retail sales data")
+        return self.data
+    
+    def load_data(self, filepath):
+        """Load data from CSV file"""
+        self.data = pd.read_csv(filepath)
+        self.data['date'] = pd.to_datetime(self.data['date'])
+        return self.data
+    
+    def exploratory_analysis(self):
+        """Perform comprehensive EDA"""
+        if self.data is None:
+            raise ValueError("No data loaded. Use generate_sample_data() or load_data() first.")
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # Time series plot
+        axes[0,0].plot(self.data['date'], self.data['sales'])
+        axes[0,0].set_title('Sales Over Time')
+        axes[0,0].set_xlabel('Date')
+        axes[0,0].set_ylabel('Sales')
+        
+        # Sales distribution
+        axes[0,1].hist(self.data['sales'], bins=50, alpha=0.7)
+        axes[0,1].set_title('Sales Distribution')
+        axes[0,1].set_xlabel('Sales')
+        axes[0,1].set_ylabel('Frequency')
+        
+        # Weekly pattern
+        weekly_sales = self.data.groupby('day_of_week')['sales'].mean()
+        axes[1,0].bar(range(7), weekly_sales.values)
+        axes[1,0].set_title('Average Sales by Day of Week')
+        axes[1,0].set_xlabel('Day of Week (0=Monday)')
+        axes[1,0].set_ylabel('Average Sales')
+        
+        # Monthly pattern
+        monthly_sales = self.data.groupby('month')['sales'].mean()
+        axes[1,1].bar(range(1, 13), monthly_sales.values)
+        axes[1,1].set_title('Average Sales by Month')
+        axes[1,1].set_xlabel('Month')
+        axes[1,1].set_ylabel('Average Sales')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Correlation heatmap
+        plt.figure(figsize=(10, 8))
+        corr_matrix = self.data.select_dtypes(include=[np.number]).corr()
+        sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0)
+        plt.title('Feature Correlation Matrix')
+        plt.show()
+        
+        # Statistical summary
+        print("\nData Summary:")
+        print(self.data.describe())
+        
+        # Stationarity test
+        result = adfuller(self.data['sales'])
+        print(f"\nADF Stationarity Test:")
+        print(f"ADF Statistic: {result[0]:.6f}")
+        print(f"p-value: {result[1]:.6f}")
+        print("Series is", "stationary" if result[1] < 0.05 else "non-stationary")
+    
+    def feature_engineering(self):
+        """Create comprehensive features for ML models"""
+        df = self.data.copy()
+        
+        # Time-based features
+        df['year'] = df['date'].dt.year
+        df['month'] = df['date'].dt.month
+        df['day'] = df['date'].dt.day
+        df['day_of_week'] = df['date'].dt.dayofweek
+        df['day_of_year'] = df['date'].dt.dayofyear
+        df['week_of_year'] = df['date'].dt.isocalendar().week
+        df['quarter'] = df['date'].dt.quarter
+        
+        # Cyclical encoding for periodic features
+        df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+        df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+        df['day_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+        df['day_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+        
+        # Lag features
+        for lag in [1, 2, 3, 7, 14, 30]:
+            df[f'sales_lag_{lag}'] = df['sales'].shift(lag)
+        
+        # Rolling window features
+        for window in [3, 7, 14, 30]:
+            df[f'sales_roll_mean_{window}'] = df['sales'].rolling(window=window).mean()
+            df[f'sales_roll_std_{window}'] = df['sales'].rolling(window=window).std()
+            df[f'sales_roll_min_{window}'] = df['sales'].rolling(window=window).min()
+            df[f'sales_roll_max_{window}'] = df['sales'].rolling(window=window).max()
+        
+        # Exponentially weighted features
+        df['sales_ewm_3'] = df['sales'].ewm(span=3).mean()
+        df['sales_ewm_7'] = df['sales'].ewm(span=7).mean()
+        
+        # Difference features
+        df['sales_diff_1'] = df['sales'].diff(1)
+        df['sales_diff_7'] = df['sales'].diff(7)
+        
+        # Interaction features
+        df['temp_weekend'] = df['temperature'] * df['is_weekend']
+        df['promo_weekend'] = df['is_promotion'] * df['is_weekend']
+        
+        # Remove rows with NaN values (due to lag features)
+        df = df.dropna()
+        
+        self.engineered_data = df
+        print(f"Feature engineering complete. Shape: {df.shape}")
+        print(f"New features created: {df.shape[1] - self.data.shape[1]}")
+        
+        return df
+    
+    def prepare_ml_data(self, target_col='sales', test_size=0.2):
+        """Prepare data for ML models"""
+        if not hasattr(self, 'engineered_data'):
+            self.feature_engineering()
+        
+        df = self.engineered_data.copy()
+        
+        # Separate features and target
+        feature_cols = [col for col in df.columns if col not in ['date', target_col]]
+        X = df[feature_cols]
+        y = df[target_col]
+        
+        # Handle categorical variables
+        categorical_cols = X.select_dtypes(include=['object', 'bool']).columns
+        for col in categorical_cols:
+            le = LabelEncoder()
+            X[col] = le.fit_transform(X[col].astype(str))
+        
+        # Time series split (respecting temporal order)
+        split_idx = int(len(X) * (1 - test_size))
+        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+        
+        # Scale features
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        self.scalers['features'] = scaler
+        
+        return X_train, X_test, y_train, y_test, X_train_scaled, X_test_scaled, feature_cols
+    
+    def train_xgboost_model(self):
+        """Train XGBoost model"""
+        X_train, X_test, y_train, y_test, _, _, feature_cols = self.prepare_ml_data()
+        
+        # XGBoost parameters
+        xgb_params = {
+            'objective': 'reg:squarederror',
+            'n_estimators': 1000,
+            'max_depth': 6,
+            'learning_rate': 0.1,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'random_state': 42,
+            'early_stopping_rounds': 50
+        }
+        
+        # Train model
+        model = xgb.XGBRegressor(**xgb_params)
+        model.fit(X_train, y_train, 
+                 eval_set=[(X_test, y_test)], 
+                 verbose=False)
+        
+        # Predictions
+        train_pred = model.predict(X_train)
+        test_pred = model.predict(X_test)
+        
+        # Store model and results
+        self.models['xgboost'] = {
+            'model': model,
+            'train_pred': train_pred,
+            'test_pred': test_pred,
+            'train_actual': y_train,
+            'test_actual': y_test
+        }
+        
+        # Feature importance
+        importance = pd.DataFrame({
+            'feature': feature_cols,
+            'importance': model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+        self.feature_importance['xgboost'] = importance
+        
+        print("XGBoost model trained successfully!")
+        return model
+    
+    def train_prophet_model(self):
+        """Train Facebook Prophet model"""
+        # Prepare data for Prophet
+        prophet_data = self.data[['date', 'sales']].copy()
+        prophet_data.columns = ['ds', 'y']
+        
+        # Add regressors
+        prophet_data['temperature'] = self.data['temperature']
+        prophet_data['is_weekend'] = self.data['is_weekend'].astype(int)
+        prophet_data['is_promotion'] = self.data['is_promotion'].astype(int)
+        
+        # Split data
+        split_idx = int(len(prophet_data) * 0.8)
+        train_data = prophet_data.iloc[:split_idx]
+        test_data = prophet_data.iloc[split_idx:]
+        
+        # Initialize and configure Prophet
+        model = Prophet(
+            daily_seasonality=True,
+            weekly_seasonality=True,
+            yearly_seasonality=True,
+            seasonality_mode='multiplicative',
+            changepoint_prior_scale=0.05
+        )
+        
+        # Add regressors
+        model.add_regressor('temperature')
+        model.add_regressor('is_weekend')
+        model.add_regressor('is_promotion')
+        
+        # Fit model
+        model.fit(train_data)
+        
+        # Make predictions
+        future = model.make_future_dataframe(periods=len(test_data))
+        future['temperature'] = prophet_data['temperature']
+        future['is_weekend'] = prophet_data['is_weekend']
+        future['is_promotion'] = prophet_data['is_promotion']
+        
+        forecast = model.predict(future)
+        
+        # Store results
+        self.models['prophet'] = {
+            'model': model,
+            'forecast': forecast,
+            'train_data': train_data,
+            'test_data': test_data
+        }
+        
+        print("Prophet model trained successfully!")
+        return model
+    
+    def evaluate_models(self):
+        """Evaluate all trained models"""
+        results = {}
+        
+        # XGBoost evaluation
+        if 'xgboost' in self.models:
+            xgb_results = self.models['xgboost']
+            
+            # Training metrics
+            train_mae = mean_absolute_error(xgb_results['train_actual'], xgb_results['train_pred'])
+            train_rmse = np.sqrt(mean_squared_error(xgb_results['train_actual'], xgb_results['train_pred']))
+            train_r2 = r2_score(xgb_results['train_actual'], xgb_results['train_pred'])
+            
+            # Test metrics
+            test_mae = mean_absolute_error(xgb_results['test_actual'], xgb_results['test_pred'])
+            test_rmse = np.sqrt(mean_squared_error(xgb_results['test_actual'], xgb_results['test_pred']))
+            test_r2 = r2_score(xgb_results['test_actual'], xgb_results['test_pred'])
+            
+            results['xgboost'] = {
+                'train_mae': train_mae, 'train_rmse': train_rmse, 'train_r2': train_r2,
+                'test_mae': test_mae, 'test_rmse': test_rmse, 'test_r2': test_r2
+            }
+        
+        # Prophet evaluation
+        if 'prophet' in self.models:
+            prophet_results = self.models['prophet']
+            forecast = prophet_results['forecast']
+            test_data = prophet_results['test_data']
+            
+            # Get test predictions
+            test_forecast = forecast.iloc[-len(test_data):]['yhat']
+            
+            test_mae = mean_absolute_error(test_data['y'], test_forecast)
+            test_rmse = np.sqrt(mean_squared_error(test_data['y'], test_forecast))
+            test_r2 = r2_score(test_data['y'], test_forecast)
+            
+            results['prophet'] = {
+                'test_mae': test_mae, 'test_rmse': test_rmse, 'test_r2': test_r2
+            }
+        
+        # Display results
+        print("\n" + "="*50)
+        print("MODEL EVALUATION RESULTS")
+        print("="*50)
+        
+        for model_name, metrics in results.items():
+            print(f"\n{model_name.upper()} Model:")
+            for metric, value in metrics.items():
+                print(f"  {metric}: {value:.2f}")
+        
+        return results
+    
+    def plot_predictions(self):
+        """Plot predictions vs actual values"""
+        fig, axes = plt.subplots(2, 1, figsize=(15, 12))
+        
+        # XGBoost plot
+        if 'xgboost' in self.models:
+            xgb_results = self.models['xgboost']
+            
+            # Plot training and test predictions
+            train_idx = range(len(xgb_results['train_actual']))
+            test_idx = range(len(xgb_results['train_actual']), 
+                           len(xgb_results['train_actual']) + len(xgb_results['test_actual']))
+            
+            axes[0].plot(train_idx, xgb_results['train_actual'], label='Actual (Train)', alpha=0.7)
+            axes[0].plot(train_idx, xgb_results['train_pred'], label='Predicted (Train)', alpha=0.7)
+            axes[0].plot(test_idx, xgb_results['test_actual'], label='Actual (Test)', alpha=0.7)
+            axes[0].plot(test_idx, xgb_results['test_pred'], label='Predicted (Test)', alpha=0.7)
+            axes[0].axvline(x=len(xgb_results['train_actual']), color='red', linestyle='--', alpha=0.5, label='Train/Test Split')
+            axes[0].set_title('XGBoost Model Predictions')
+            axes[0].legend()
+            axes[0].grid(True, alpha=0.3)
+        
+        # Prophet plot
+        if 'prophet' in self.models:
+            prophet_results = self.models['prophet']
+            forecast = prophet_results['forecast']
+            
+            axes[1].plot(forecast['ds'], forecast['yhat'], label='Prophet Forecast', alpha=0.8)
+            axes[1].fill_between(forecast['ds'], forecast['yhat_lower'], forecast['yhat_upper'], 
+                               alpha=0.3, label='Confidence Interval')
+            axes[1].plot(self.data['date'], self.data['sales'], label='Actual', alpha=0.7)
+            axes[1].set_title('Prophet Model Predictions')
+            axes[1].legend()
+            axes[1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def plot_feature_importance(self):
+        """Plot feature importance for XGBoost"""
+        if 'xgboost' in self.feature_importance:
+            importance = self.feature_importance['xgboost'].head(15)
+            
+            plt.figure(figsize=(10, 8))
+            sns.barplot(data=importance, x='importance', y='feature')
+            plt.title('Top 15 Feature Importance (XGBoost)')
+            plt.xlabel('Importance')
+            plt.tight_layout()
+            plt.show()
+    
+    def forecast_future(self, days=30):
+        """Generate future forecasts"""
+        if 'prophet' in self.models:
+            model = self.models['prophet']['model']
+            
+            # Create future dataframe
+            future = model.make_future_dataframe(periods=days)
+            
+            # Add regressor values (simple extension)
+            last_temp = self.data['temperature'].iloc[-1]
+            future['temperature'] = last_temp  # Simplified - could use weather forecasts
+            future['is_weekend'] = future['ds'].dt.dayofweek >= 5
+            future['is_promotion'] = False  # No promotions scheduled
+            
+            # Make forecast
+            forecast = model.predict(future)
+            
+            # Plot future forecast
+            fig = model.plot(forecast)
+            plt.title('Sales Forecast with Prophet')
+            plt.show()
+            
+            # Return future predictions
+            future_forecast = forecast.tail(days)[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
+            future_forecast.columns = ['date', 'forecast', 'lower_bound', 'upper_bound']
+            
+            print(f"\nFuture {days}-day forecast:")
+            print(future_forecast.head(10))
+            
+            return future_forecast
+    
+    def run_complete_analysis(self):
+        """Run the complete forecasting pipeline"""
+        print("Starting Retail Sales Forecasting Analysis...")
+        print("="*50)
+        
+        # Generate sample data
+        self.generate_sample_data()
+        
+        # Exploratory analysis
+        print("\n1. Performing Exploratory Data Analysis...")
+        self.exploratory_analysis()
+        
+        # Feature engineering
+        print("\n2. Engineering Features...")
+        self.feature_engineering()
+        
+        # Train models
+        print("\n3. Training Models...")
+        self.train_xgboost_model()
+        self.train_prophet_model()
+        
+        # Evaluate models
+        print("\n4. Evaluating Models...")
+        self.evaluate_models()
+        
+        # Plot results
+        print("\n5. Visualizing Results...")
+        self.plot_predictions()
+        self.plot_feature_importance()
+        
+        # Future forecast
+        print("\n6. Generating Future Forecast...")
+        future_forecast = self.forecast_future(30)
+        
+        print("\nAnalysis Complete!")
+        return future_forecast
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize forecaster
+    forecaster = RetailSalesForecaster()
+    
+    # Run complete analysis
+    future_predictions = forecaster.run_complete_analysis()
+    
+    # Access individual components
+    # forecaster.data  # Original data
+    # forecaster.models  # Trained models
+    # forecaster.feature_importance  # Feature importance scores
+
+    #pip install pandas numpy seaborn matplotlib scikit-learn xgboost prophet statsmodels
